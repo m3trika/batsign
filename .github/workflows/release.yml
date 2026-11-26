@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write      # build provenance attestation (Sigstore)
+  attestations: write
 
 concurrency:
   group: build-${{ github.ref }}
@@ -69,9 +71,70 @@ jobs:
         run: |
           agvtool new-version -all "$(git rev-list --count HEAD)"
 
+      - name: Prepare the local installer CA
+        # Recommended: store your CA once as repository secrets so every build is a
+        # renewal under the same CA and the phone keeps trusting it:
+        #   BATSIGN_CA_CERT_B64 = base64 of ca.crt, BATSIGN_CA_KEY_B64 = base64 of ca.key
+        # (make them with scripts/make-local-pki.sh, then `base64 < ~/.batsign-pki/ca.key`).
+        # Without the secrets, each build gets a throw-away CA whose key is destroyed,
+        # and its profile must be trusted on the phone again.
+        # The CA key never enters the app or any artifact.
+        env:
+          CA_CERT_B64: ${{ secrets.BATSIGN_CA_CERT_B64 }}
+          CA_KEY_B64: ${{ secrets.BATSIGN_CA_KEY_B64 }}
+        run: |
+          set -eu
+          if [ -n "${CA_CERT_B64:-}" ] && [ -n "${CA_KEY_B64:-}" ]; then
+            mkdir -p "$RUNNER_TEMP/pki" && chmod 700 "$RUNNER_TEMP/pki"
+            printf '%s' "$CA_CERT_B64" | base64 -d > "$RUNNER_TEMP/pki/ca.crt"
+            printf '%s' "$CA_KEY_B64" | base64 -d > "$RUNNER_TEMP/pki/ca.key"
+            chmod 600 "$RUNNER_TEMP/pki/ca.key"
+            echo "BATSIGN_CA_CERT=$RUNNER_TEMP/pki/ca.crt" >> "$GITHUB_ENV"
+            echo "BATSIGN_CA_KEY=$RUNNER_TEMP/pki/ca.key" >> "$GITHUB_ENV"
+            echo "Using the CA from repository secrets (renewal)."
+          else
+            echo "::warning::No CA secrets set: this build uses a throw-away CA. Its trust profile must be installed and trusted on the phone again."
+            echo "PKI_FLAGS=--ephemeral" >> "$GITHUB_ENV"
+          fi
+
       - name: Build (unsigned, iOS device)
         run: |
-          make iphoneos
+          make iphoneos PKI_FLAGS="${PKI_FLAGS:-}"
+          rm -rf "$RUNNER_TEMP/pki"
+
+      - name: Verify the IPA
+        run: |
+          set -eu
+          rm -rf verify && mkdir verify
+          unzip -q packages/BatSign.ipa -d verify
+          APP="$(echo verify/Payload/*.app)"
+          for f in server.crt server.pem commonName.txt BatSignLocalCA.crt BatSignLocalCA.mobileconfig; do
+            test -f "$APP/$f" || { echo "missing $f in the app" >&2; exit 1; }
+          done
+          if find "$APP" -iname 'ca.key' | grep .; then echo "a CA key is inside the app" >&2; exit 1; fi
+          HOST="$(cat "$APP/commonName.txt")"
+          openssl verify -CAfile "$APP/BatSignLocalCA.crt" -purpose sslserver -verify_hostname "$HOST" "$APP/server.crt"
+          openssl x509 -in "$APP/server.crt" -noout -checkend 0
+          test "$(openssl x509 -in "$APP/server.crt" -noout -pubkey | openssl sha256)" = \
+               "$(openssl pkey -in "$APP/server.pem" -pubout | openssl sha256)"
+          plutil -lint "$APP/BatSignLocalCA.mobileconfig"
+          if strings "$APP/BatSign" "$APP/Feather" 2>/dev/null | grep -E 'backloop\.dev/pack\.json|perki/backloop'; then
+            echo "note: the legacy download code is still compiled in, but is unused when a local CA is bundled"
+          fi
+          rm -rf verify
+
+      - name: Checksum
+        run: |
+          set -eu
+          cd packages
+          shasum -a 256 BatSign.ipa | tee BatSign.ipa.sha256
+          echo "IPA_SHA256=$(cut -d' ' -f1 BatSign.ipa.sha256)" >> "$GITHUB_ENV"
+          cp ../deps/BatSignLocalCA.mobileconfig ../deps/BatSignLocalCA.crt .
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: packages/BatSign.ipa
 
       - name: Package IPA
         run: |
@@ -85,7 +148,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: BatSign-ipa
-          path: packages/BatSign.ipa
+          path: |
+            packages/BatSign.ipa
+            packages/BatSign.ipa.sha256
+            packages/BatSignLocalCA.mobileconfig
+            packages/BatSignLocalCA.crt
           if-no-files-found: error
 
       - name: Release (tags only)
@@ -93,6 +160,39 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: BatSign ${{ github.ref_name }}
-          files: packages/BatSign.ipa
+          files: |
+            packages/BatSign.ipa
+            packages/BatSign.ipa.sha256
+            packages/BatSignLocalCA.mobileconfig
+            packages/BatSignLocalCA.crt
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+      - name: Rolling build release (main)
+        # A pre-release that always holds the newest build of main, so it can be
+        # downloaded on a phone without signing in. Every asset is the exact output
+        # of this run; verify with:
+        #   gh attestation verify BatSign.ipa --repo ${{ github.repository }}
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          cat > notes.md <<EOF
+          Built from commit \`${GITHUB_SHA}\` by [run ${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}).
+
+          SHA-256 of \`BatSign.ipa\`: \`${IPA_SHA256}\`
+
+          Verify that this IPA was built by this repository's workflow from that commit:
+          \`gh attestation verify BatSign.ipa --repo ${GITHUB_REPOSITORY}\`
+
+          Install \`BatSignLocalCA.mobileconfig\` from this build (or use Settings › Installation › Server & SSL › Export Trust Profile in the app) and trust it, or Fully Local installs cannot start.
+          EOF
+          gh release delete latest-build --cleanup-tag -y || true
+          gh release create latest-build \
+            packages/BatSign.ipa packages/BatSign.ipa.sha256 \
+            packages/BatSignLocalCA.mobileconfig packages/BatSignLocalCA.crt \
+            --title "Latest build (${GITHUB_SHA::7})" \
+            --notes-file notes.md \
+            --prerelease \
+            --target "$GITHUB_SHA"

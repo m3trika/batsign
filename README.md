@@ -30,6 +30,41 @@ is written from scratch. There is no server of mine in the middle of it and no
 analytics anywhere in the app. The one network call the app makes on its own behalf
 is a check against your own repositories.
 
+## Fully Local install fix (private local CA)
+
+Fully Local installs used to download the public `backloop.dev` certificate, which
+no longer exists (and which iOS rejected anyway), so installs sat on *Ready* /
+*Installing* for ever. Builds now ship a certificate issued by a **private CA made
+at build time** (`scripts/make-local-pki.sh`), name-constrained to
+`batsign.backloop.dev`, a name that resolves to `127.0.0.1`. Nothing is downloaded.
+
+One-time setup on the phone:
+
+1. Sign and install `BatSign.ipa` with your own certificate.
+2. In BatSign: **Settings › Installation › Server & SSL › Export Trust Profile**, save it to Files
+   (it is also attached to every release as `BatSignLocalCA.mobileconfig`).
+3. Open it in Files, then install it in **Settings › General › VPN & Device Management**.
+4. Turn on **BatSign Local Installer CA** in **Settings › General › About › Certificate Trust Settings**.
+5. Back in BatSign, tap **Test Trust**; it should say PASS.
+
+If the CA is not trusted, BatSign now says so instead of hanging. Keep your own
+IPA and profile to yourself: the leaf key is inside the app.
+
+### Verified builds
+
+Every IPA is built from source by `.github/workflows/release.yml`, gets a SHA-256
+checksum, and a [GitHub build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations).
+Check that an IPA came from this repository's workflow, and from which commit:
+
+```sh
+gh attestation verify BatSign.ipa --repo m3trika/batsign
+```
+
+To keep trusting the same CA across builds, add the repository secrets
+`BATSIGN_CA_CERT_B64` and `BATSIGN_CA_KEY_B64` (base64 of `ca.crt` / `ca.key` from
+`scripts/make-local-pki.sh`). Without them each build uses a throw-away CA, and its
+profile must be trusted again after updating.
+
 ## Changes in this fork
 
 This fork of [8yy/BatSign](https://github.com/8yy/BatSign) fixes the external-file

@@ -3,7 +3,6 @@ SCHEME := Feather
 PLATFORMS := iphoneos maccatalyst
 
 TMP := $(TMPDIR)/$(NAME)
-CERT_JSON_URL := https://backloop.dev/pack.json
 
 .PHONY: all clean deps $(PLATFORMS)
 
@@ -14,16 +13,16 @@ clean:
 	rm -rf packages
 	rm -rf Payload
 
+# The local HTTPS installer's TLS identity: a private, name-constrained CA and a
+# short-lived leaf (scripts/make-local-pki.sh). The public backloop.dev pack that
+# used to be downloaded here no longer exists, which is what left installs stuck.
+# Locally the CA is kept in ~/.batsign-pki; CI passes BATSIGN_CA_KEY/BATSIGN_CA_CERT
+# or PKI_FLAGS=--ephemeral.
+PKI_FLAGS ?=
+
 deps:
 	rm -rf deps || true
-	mkdir -p deps
-
-	-curl -fsSL "$(CERT_JSON_URL)" -o cert.json
-	@if [ -f cert.json ]; then \
-		jq -r '.cert' cert.json > deps/server.crt; \
-		jq -r '.key1, .key2' cert.json > deps/server.pem; \
-		jq -r '.info.domains.commonName' cert.json > deps/commonName.txt; \
-	fi
+	sh scripts/make-local-pki.sh --out deps $(PKI_FLAGS)
 
 
 $(PLATFORMS): deps
@@ -48,7 +47,7 @@ $(PLATFORMS): deps
 	cp -R _build/Applications/*.app _build/Payload/BatSign.app
 	chmod -R 0755 _build/Payload/BatSign.app
 	codesign --force --sign - --timestamp=none _build/Payload/BatSign.app
-	cp deps/* _build/Payload/BatSign.app/ || true
+	cp deps/* _build/Payload/BatSign.app/
 
 	mkdir -p packages
 

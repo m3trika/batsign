@@ -175,6 +175,15 @@ extension ServerInstaller {
 	static func getUrl(_ name: String, ext: String) -> URL? {
 		let fileManager = FileManager.default
 
+		// A build with a private local CA always serves the leaf that CA issued.
+		// Certificates downloaded by older versions may still sit in Documents;
+		// they are the dead public backloop.dev ones and must not win.
+		if LocalCA.isBundled,
+			LocalCA.identityFileNames.contains("\(name).\(ext)"),
+			let bundled = Bundle.main.url(forResource: name, withExtension: ext) {
+			return bundled
+		}
+
 		// The directory the certificate fix installs into.
 		let serverURL = URL.documentsDirectory.appendingPathComponent("App").appendingPathComponent("Server").appendingPathComponent("\(name).\(ext)")
 		if fileManager.fileExists(atPath: serverURL.path) {

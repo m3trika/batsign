@@ -41,6 +41,19 @@ class ServerInstaller: Identifiable, ObservableObject {
 		self.app = app
 		self.viewModel = viewModel
 		_setup()
+
+		// Fully Local with the private CA: if the phone does not trust the CA
+		// yet, installd would refuse the manifest without telling anyone and the
+		// install would sit on "Ready" for ever. Refuse here instead, with the
+		// steps to fix it.
+		if _server != nil, getServerMethod() != 1, usesTLS, LocalCA.isBundled {
+			if case .notTrusted(let reason) = LocalCA.evaluateSystemTrust() {
+				startupError = LocalCA.NotTrustedError(reason: reason)
+				_server?.shutdown()
+				_server = nil
+			}
+		}
+
 		_configureRoutes()
 
 		do {
